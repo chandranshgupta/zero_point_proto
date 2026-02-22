@@ -1,0 +1,33 @@
+name: stealth_chat
+description: Secure Stealth Chat App
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  
+  
+  shared_preferences: ^2.2.3
+  web_socket_channel: ^3.0.3
+
+  # AES demo encryption (for ChatScreen demo)
+  encrypt: ^5.0.3
+
+  # Real E2EE (X25519 + AES-GCM)
+  cryptography: ^2.5.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
