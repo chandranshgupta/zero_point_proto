@@ -50,35 +50,31 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
 
   String _netStatus = "Not connected";
   bool _keysReady = false;
+  bool _connected = false;
   String _myPublicKeyBase64 = "Generating...";
 
   final List<ChatItem> _items = [];
   static int _idCounter = 0;
   String _nextId() => (++_idCounter).toString();
 
-  // ✅ Message timer selector
   final List<int> _timerOptions = [10, 30, 60, 120];
   int _selectedTimer = 30;
 
-  // ✅ Session status
-  bool _connected = false;
   int _identityRemaining = 0;
   Timer? _identityTick;
 
-@override
-void initState() {
-  super.initState();
-  _initializeSession();
-}
+  @override
+  void initState() {
+    super.initState();
+    _initializeSession();
+  }
 
-Future<void> _initializeSession() async {
-  // 🔐 Set identity flush timer (24 hours for demo)
-  await _identity.setFlushHours(24);
-
-  await _initKeys();
-  _listenIncoming();
-  _startIdentityCountdown();
-}
+  Future<void> _initializeSession() async {
+    await _identity.setFlushHours(24);
+    await _initKeys();
+    _listenIncoming();
+    _startIdentityCountdown();
+  }
 
   Future<void> _initKeys() async {
     await _e2ee.generateKeyPair();
@@ -118,12 +114,56 @@ Future<void> _initializeSession() async {
         setState(() {
           _items.insert(0, item);
         });
-      } catch (_) {}
+      } catch (e) {
+        debugPrint("Receive/decrypt failed: $e");
+      }
     });
+  }
+
+  Future<void> _setPeerKey() async {
+    final peerKey = _peerKeyController.text.trim();
+    if (peerKey.isEmpty) return;
+
+    try {
+      await _e2ee.setPeerPublicKeyBase64(peerKey);
+      if (!mounted) return;
+
+      setState(() {
+        _keysReady = _e2ee.isReady;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Peer key set ✅ E2EE ready")),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Invalid peer key: $e")),
+      );
+    }
+  }
+
+  Future<void> _connectRelay() async {
+    final ip = _peerIpController.text.trim();
+    final ok = await _transport.connectToServer(ip, port: 4040);
+
+    if (!mounted) return;
+    setState(() {
+      _connected = ok;
+      _netStatus = ok
+          ? "Connected to $ip:4040"
+          : "Failed to connect to $ip:4040";
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? "Relay connected ✅" : "Relay connection failed ❌"),
+      ),
+    );
   }
 
   void _startTimer(ChatItem item) {
     item.timer?.cancel();
+
     item.timer = Timer.periodic(const Duration(seconds: 1), (t) {
       if (!mounted) return;
 
@@ -154,52 +194,21 @@ Future<void> _initializeSession() async {
     });
   }
 
-  Future<void> _setPeerKey() async {
-    final peerKey = _peerKeyController.text.trim();
-    if (peerKey.isEmpty) return;
-
-    try {
-      await _e2ee.setPeerPublicKeyBase64(peerKey);
-      if (!mounted) return;
-
-      setState(() => _keysReady = _e2ee.isReady);
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Peer key set ✅ E2EE ready")),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Invalid peer key: $e")),
-      );
-    }
-  }
-
-  Future<void> _connectRelay() async {
-    final ip = _peerIpController.text.trim();
-    await _transport.connectToServer(ip, port: 4040);
-    if (!mounted) return;
-    setState(() {
-      _connected = true;
-      _netStatus = "Connected to $ip:4040";
-    });
-  }
-
-  // ✅ Identity session countdown tick (master timer)
   void _startIdentityCountdown() {
     _identityTick?.cancel();
+
     _identityTick = Timer.periodic(const Duration(seconds: 1), (_) async {
       final remaining = await _identity.remainingSeconds();
-      if (!mounted) return;
 
+      if (!mounted) return;
       setState(() {
         _identityRemaining = remaining;
       });
 
       if (remaining <= 0) {
         await _secureWipeAll(showToast: false);
-        if (!mounted) return;
 
-        // simple reset: pop to previous screen
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Identity flushed ✅ Resetting...")),
         );
@@ -208,25 +217,14 @@ Future<void> _initializeSession() async {
     });
   }
 
-  String _fmt(int s) {
-    final h = (s ~/ 3600).toString().padLeft(2, '0');
-    final m = ((s % 3600) ~/ 60).toString().padLeft(2, '0');
-    final sec = (s % 60).toString().padLeft(2, '0');
-    return "$h:$m:$sec";
-  }
-
   Future<void> _secureWipeAll({bool showToast = true}) async {
-    // cancel message timers
     for (final m in _items) {
       m.timer?.cancel();
     }
-    // clear messages
+
     setState(() {
       _items.clear();
     });
-
-    // flush identity timer (optional; for "wipe chat only" we won't call this)
-    // Here we keep identity until explicit flush button.
 
     if (showToast) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -236,8 +234,9 @@ Future<void> _initializeSession() async {
   }
 
   Future<void> _flushIdentityNow() async {
-    await _identity.flushAll();
+    await _identity.flushIdentity();
     await _secureWipeAll(showToast: false);
+
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("Identity flushed ✅")),
@@ -258,15 +257,16 @@ Future<void> _initializeSession() async {
 
     if (!_transport.isConnected) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Connect to relay first (10.0.2.2)")),
+        const SnackBar(content: Text("Connect to relay first")),
       );
       return;
     }
 
-    // ✅ session limit = min(identityRemaining, selectedTimer)
     final nowUtc = DateTime.now().toUtc();
     final msgSeconds = (_identityRemaining > 0)
-        ? (_selectedTimer < _identityRemaining ? _selectedTimer : _identityRemaining)
+        ? (_selectedTimer < _identityRemaining
+        ? _selectedTimer
+        : _identityRemaining)
         : _selectedTimer;
 
     final expiresAtUtc = nowUtc.add(Duration(seconds: msgSeconds));
@@ -294,7 +294,15 @@ Future<void> _initializeSession() async {
       _messageController.clear();
     });
 
-    _transport.send(_transport.pack(enc));
+    final packed = _transport.pack(enc);
+    _transport.send(packed);
+  }
+
+  String _fmt(int s) {
+    final h = (s ~/ 3600).toString().padLeft(2, '0');
+    final m = ((s % 3600) ~/ 60).toString().padLeft(2, '0');
+    final sec = (s % 60).toString().padLeft(2, '0');
+    return "$h:$m:$sec";
   }
 
   Widget _chip(String text) {
@@ -337,31 +345,49 @@ Future<void> _initializeSession() async {
                   title,
                   style: TextStyle(
                     fontSize: 16,
-                    color: m.state == MsgState.deleted ? Colors.white54 : Colors.white,
-                    fontStyle: m.state == MsgState.deleted ? FontStyle.italic : FontStyle.normal,
+                    color:
+                    m.state == MsgState.deleted ? Colors.white54 : Colors.white,
+                    fontStyle: m.state == MsgState.deleted
+                        ? FontStyle.italic
+                        : FontStyle.normal,
                   ),
                 ),
                 const SizedBox(height: 10),
-                Row(
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
                   children: [
                     _chip(isSent ? "Sent" : "Received"),
-                    const SizedBox(width: 8),
                     _chip("E2EE"),
-                    const SizedBox(width: 8),
-                    _chip(m.state == MsgState.deleted ? "Expired" : "Expires ${m.secondsLeft}s"),
+                    _chip(
+                      m.state == MsgState.deleted
+                          ? "Expired"
+                          : "Expires ${m.secondsLeft}s",
+                    ),
                   ],
                 ),
                 const SizedBox(height: 10),
                 InkWell(
-                  onTap: () => setState(() => m.showEncrypted = !m.showEncrypted),
+                  onTap: () {
+                    setState(() {
+                      m.showEncrypted = !m.showEncrypted;
+                    });
+                  },
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(m.showEncrypted ? Icons.expand_less : Icons.expand_more, size: 18),
+                      Icon(
+                        m.showEncrypted ? Icons.expand_less : Icons.expand_more,
+                        size: 18,
+                      ),
                       const SizedBox(width: 6),
                       Text(
-                        m.showEncrypted ? "Hide encrypted" : "Show encrypted",
-                        style: const TextStyle(decoration: TextDecoration.underline),
+                        m.showEncrypted
+                            ? "Hide encrypted"
+                            : "Show encrypted",
+                        style: const TextStyle(
+                          decoration: TextDecoration.underline,
+                        ),
                       ),
                     ],
                   ),
@@ -381,6 +407,93 @@ Future<void> _initializeSession() async {
     );
   }
 
+  Widget _buildTopSection() {
+    final sessionText =
+    _identityRemaining > 0 ? _fmt(_identityRemaining) : "--:--:--";
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _chip(_connected ? "Connected" : "Offline"),
+            _chip(_keysReady ? "E2EE Ready" : "E2EE Not Ready"),
+            _chip("Session: $sessionText"),
+            _chip("Msg TTL: ${_selectedTimer}s"),
+          ],
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          "Your Public Key (share to peer):",
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            border: Border.all(color: Colors.white24),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: SelectableText(_myPublicKeyBase64),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: _peerKeyController,
+          minLines: 2,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            labelText: "Paste Peer Public Key (base64)",
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 10),
+        ElevatedButton(
+          onPressed: _setPeerKey,
+          child: Text(_keysReady ? "E2EE Ready ✅" : "Set Peer Key"),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: _peerIpController,
+          decoration: const InputDecoration(
+            labelText: "Relay IP (use 10.0.2.2)",
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 8),
+        ElevatedButton(
+          onPressed: _connectRelay,
+          child: const Text("Connect Relay"),
+        ),
+        const SizedBox(height: 6),
+        Text(_netStatus, style: const TextStyle(fontSize: 12)),
+        const SizedBox(height: 10),
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          children: [
+            const Text("Message Timer:"),
+            DropdownButton<int>(
+              value: _selectedTimer,
+              items: _timerOptions
+                  .map(
+                    (s) => DropdownMenuItem(value: s, child: Text("${s}s")),
+              )
+                  .toList(),
+              onChanged: (v) {
+                if (v == null) return;
+                setState(() {
+                  _selectedTimer = v;
+                });
+              },
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
   @override
   void dispose() {
     for (final m in _items) {
@@ -396,9 +509,10 @@ Future<void> _initializeSession() async {
 
   @override
   Widget build(BuildContext context) {
-    final sessionText = _identityRemaining > 0 ? _fmt(_identityRemaining) : "--:--:--";
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
 
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       appBar: AppBar(
         title: const Text("Secure E2EE Chat"),
         actions: [
@@ -414,106 +528,22 @@ Future<void> _initializeSession() async {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          // STATUS BAR
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 10, 10, 6),
-            child: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                _chip(_connected ? "Connected" : "Offline"),
-                _chip(_keysReady ? "E2EE Ready" : "E2EE Not Ready"),
-                _chip("Session: $sessionText"),
-                _chip("Msg TTL: ${_selectedTimer}s"),
-              ],
-            ),
-          ),
-
-          // KEY + RELAY + TIMER SELECTOR
-          Padding(
-            padding: const EdgeInsets.all(10),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text("Your Public Key (share to peer):",
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 6),
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.white24),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: SelectableText(_myPublicKeyBase64),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _peerKeyController,
-                  minLines: 2,
-                  maxLines: 3,
-                  decoration: const InputDecoration(
-                    labelText: "Paste Peer Public Key (base64)",
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                ElevatedButton(
-                  onPressed: _setPeerKey,
-                  child: Text(_keysReady ? "E2EE Ready ✅" : "Set Peer Key"),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _peerIpController,
-                  decoration: const InputDecoration(
-                    labelText: "Relay IP (use 10.0.2.2)",
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                ElevatedButton(
-                  onPressed: _connectRelay,
-                  child: const Text("Connect Relay"),
-                ),
-                const SizedBox(height: 6),
-                Text(_netStatus, style: const TextStyle(fontSize: 12)),
-
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    const Text("Message Timer:  "),
-                    DropdownButton<int>(
-                      value: _selectedTimer,
-                      items: _timerOptions
-                          .map((s) => DropdownMenuItem(value: s, child: Text("${s}s")))
-                          .toList(),
-                      onChanged: (v) {
-                        if (v == null) return;
-                        setState(() => _selectedTimer = v);
-                      },
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-
-          const Divider(height: 1),
-
-          Expanded(
-            child: _items.isEmpty
-                ? const Center(child: Text("No messages yet"))
-                : ListView.builder(
-                    reverse: true,
-                    itemCount: _items.length,
-                    itemBuilder: (context, index) => _messageBubble(_items[index]),
-                  ),
-          ),
-
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
-            child: Row(
+      body: SafeArea(
+        child: ListView(
+          padding: EdgeInsets.fromLTRB(10, 10, 10, 10 + bottomInset),
+          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+          children: [
+            _buildTopSection(),
+            const Divider(height: 20),
+            if (_items.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 20),
+                child: Center(child: Text("No messages yet")),
+              )
+            else
+              ..._items.map(_messageBubble),
+            const SizedBox(height: 12),
+            Row(
               children: [
                 Expanded(
                   child: TextField(
@@ -531,8 +561,8 @@ Future<void> _initializeSession() async {
                 ),
               ],
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
