@@ -1,5 +1,65 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
 import '../../services/e2ee_service.dart';
+import '../../services/p2p_ws_transport.dart';
+
+class BroadcastPeer {
+  final String id;
+  final String name;
+  final String userId;
+  final String publicKey;
+
+  BroadcastPeer({
+    required this.id,
+    required this.name,
+    required this.userId,
+    required this.publicKey,
+  });
+}
+
+class SentRecipientStatus {
+  final String userId;
+  final String name;
+  String state;
+
+  SentRecipientStatus({
+    required this.userId,
+    required this.name,
+    this.state = "Sent",
+  });
+}
+
+class SentBroadcastItem {
+  final String baseMessageId;
+  final String text;
+  final int expiresAtMs;
+  final List<SentRecipientStatus> recipients;
+
+  SentBroadcastItem({
+    required this.baseMessageId,
+    required this.text,
+    required this.expiresAtMs,
+    required this.recipients,
+  });
+}
+
+class ReceivedBroadcastItem {
+  final String messageId;
+  final String fromUserId;
+  final String text;
+  final int expiresAtMs;
+
+  ReceivedBroadcastItem({
+    required this.messageId,
+    required this.fromUserId,
+    required this.text,
+    required this.expiresAtMs,
+  });
+}
 
 class GroupBroadcastScreen extends StatefulWidget {
   const GroupBroadcastScreen({super.key});
@@ -9,17 +69,34 @@ class GroupBroadcastScreen extends StatefulWidget {
 }
 
 class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
+  final _myUserIdController = TextEditingController();
+  final _relayIpController = TextEditingController(text: "10.0.2.2");
   final _messageController = TextEditingController();
-  final _peerController = TextEditingController();
 
-  E2EEService? _e2ee;
+  final _recipientNameController = TextEditingController();
+  final _recipientUserIdController = TextEditingController();
+  final _recipientKeyController = TextEditingController();
 
-  final List<String> peers = [];
-  final List<String> encryptedPackets = [];
+  final _transport = P2PWsTransport();
+  final _crypto = E2EEService();
 
-  bool _loadingKeys = true;
-  String _publicKeyText = "Generating...";
-  String? _initError;
+  final List<BroadcastPeer> _recipients = [];
+  final List<SentBroadcastItem> _sentBroadcasts = [];
+  final List<ReceivedBroadcastItem> _receivedMessages = [];
+
+  final List<int> _ttlOptions = [10, 30, 60, 120];
+  int _selectedTtl = 30;
+
+  String _status = "Not connected";
+  String _myPublicKey = "Generating...";
+
+  bool _connected = false;
+  bool _registered = false;
+  bool _keysReady = false;
+
+  Timer? _ticker;
+  int _recipientCounter = 0;
+  int _messageCounter = 0;
 
   @override
   void initState() {
@@ -28,263 +105,637 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
   }
 
   Future<void> _initCrypto() async {
-    try {
-      final service = E2EEService();
-      await service.generateKeyPair();
-
-      if (!mounted) return;
-
-      setState(() {
-        _e2ee = service;
-        _publicKeyText = service.exportMyPublicKeyBase64();
-        _loadingKeys = false;
-        _initError = null;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loadingKeys = false;
-        _initError = e.toString();
-      });
-    }
-  }
-
-  void addPeer() {
-    final key = _peerController.text.trim();
-    if (key.isEmpty) return;
-
-    setState(() {
-      peers.add(key);
-    });
-
-    _peerController.clear();
-  }
-
-  void removePeer(int index) {
-    setState(() {
-      peers.removeAt(index);
-    });
-  }
-
-  Future<void> encryptForAll() async {
-    final service = _e2ee;
-    if (service == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Crypto not ready yet")),
-      );
-      return;
-    }
-
-    final message = _messageController.text.trim();
-
-    if (message.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Enter a message first")),
-      );
-      return;
-    }
-
-    if (peers.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Add at least one peer first")),
-      );
-      return;
-    }
-
-    final packets = <String>[];
-
-    for (final peerKey in peers) {
-      try {
-        await service.setPeerPublicKeyBase64(peerKey);
-        final encrypted = await service.encrypt(message);
-        packets.add(encrypted);
-      } catch (e) {
-        packets.add("Encryption failed for one peer: $e");
-      }
-    }
+    await _crypto.generateKeyPair();
 
     if (!mounted) return;
     setState(() {
-      encryptedPackets
-        ..clear()
-        ..addAll(packets);
+      _myPublicKey = _crypto.exportMyPublicKeyBase64();
+      _keysReady = true;
+    });
+
+    _transport.incoming.listen(_handleIncoming);
+    _startTicker();
+  }
+
+  void _startTicker() {
+    _ticker?.cancel();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      _cleanupExpired();
+      setState(() {});
     });
   }
 
-  Widget _peerList() {
-    if (peers.isEmpty) {
-      return const Text("No peers added");
+  void _cleanupExpired() {
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    _sentBroadcasts.removeWhere((m) => nowMs >= m.expiresAtMs + 2000);
+    _receivedMessages.removeWhere((m) => nowMs >= m.expiresAtMs + 2000);
+  }
+
+  int _remainingSeconds(int expiresAtMs) {
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    final leftMs = expiresAtMs - nowMs;
+    if (leftMs <= 0) return 0;
+    return ((leftMs + 999) ~/ 1000);
+  }
+
+  Future<void> _connectRelay() async {
+    final ip = _relayIpController.text.trim();
+    final userId = _myUserIdController.text.trim();
+
+    if (userId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Enter My User ID")),
+      );
+      return;
     }
 
-    return Column(
-      children: List.generate(peers.length, (index) {
-        final peer = peers[index];
-        return Card(
-          child: ListTile(
-            title: Text(
-              "Peer ${index + 1}",
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-            subtitle: Text(
-              peer,
-              style: const TextStyle(fontSize: 12),
-            ),
-            trailing: IconButton(
-              icon: const Icon(Icons.delete_outline),
-              onPressed: () => removePeer(index),
-            ),
+    final ok = await _transport.connectToServer(ip);
+
+    if (!mounted) return;
+
+    if (!ok) {
+      setState(() {
+        _connected = false;
+        _registered = false;
+        _status = "Connection failed";
+      });
+      return;
+    }
+
+    _transport.sendRaw(jsonEncode({
+      "type": "register",
+      "userId": userId,
+    }));
+
+    setState(() {
+      _connected = true;
+      _status = "Connected to relay";
+    });
+  }
+
+  Future<void> _handleIncoming(String raw) async {
+    try {
+      final obj = jsonDecode(raw);
+
+      if (obj is! Map<String, dynamic>) return;
+
+      if (obj["type"] == "register_ok") {
+        if (!mounted) return;
+        setState(() {
+          _registered = true;
+          _status = "Registered as ${obj["userId"]}";
+        });
+        return;
+      }
+
+      if (obj["type"] == "ack") {
+        final messageId = obj["messageId"]?.toString();
+        final targetUserId = obj["targetUserId"]?.toString();
+
+        if (messageId == null || targetUserId == null) return;
+
+        final baseId = messageId.split("|").first;
+
+        for (final msg in _sentBroadcasts) {
+          if (msg.baseMessageId == baseId) {
+            for (final recipient in msg.recipients) {
+              if (recipient.userId == targetUserId) {
+                recipient.state = "Delivered";
+              }
+            }
+          }
+        }
+
+        if (!mounted) return;
+        setState(() {});
+        return;
+      }
+
+      if (obj["type"] != "group_msg") return;
+
+      final myUserId = _myUserIdController.text.trim();
+      final to = obj["to"]?.toString();
+      if (to == null || to != myUserId) return;
+
+      final fromUserId = obj["from"]?.toString();
+      final senderPublicKey = obj["senderPublicKey"]?.toString();
+      final payload = obj["payload"]?.toString();
+      final messageId = obj["messageId"]?.toString();
+
+      if (fromUserId == null ||
+          senderPublicKey == null ||
+          payload == null ||
+          messageId == null) {
+        return;
+      }
+
+      await _crypto.setPeerPublicKeyBase64(senderPublicKey);
+
+      final decryptedJson = await _crypto.decrypt(payload);
+      final map = jsonDecode(decryptedJson) as Map<String, dynamic>;
+
+      final text = map["text"]?.toString() ?? "";
+      final expiresAtMs = map["expiresAtMs"] is int
+          ? map["expiresAtMs"] as int
+          : int.tryParse(map["expiresAtMs"].toString()) ?? 0;
+
+      if (expiresAtMs <= DateTime.now().toUtc().millisecondsSinceEpoch) {
+        return;
+      }
+
+      final alreadyExists =
+          _receivedMessages.any((m) => m.messageId == messageId);
+      if (alreadyExists) return;
+
+      if (!mounted) return;
+      setState(() {
+        _receivedMessages.insert(
+          0,
+          ReceivedBroadcastItem(
+            messageId: messageId,
+            fromUserId: fromUserId,
+            text: text,
+            expiresAtMs: expiresAtMs,
           ),
         );
-      }),
+      });
+    } catch (_) {}
+  }
+
+  void _addRecipient() {
+    final name = _recipientNameController.text.trim();
+    final userId = _recipientUserIdController.text.trim();
+    final key = _recipientKeyController.text.trim();
+
+    if (name.isEmpty || userId.isEmpty || key.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Fill all recipient fields")),
+      );
+      return;
+    }
+
+    setState(() {
+      _recipientCounter++;
+      _recipients.add(
+        BroadcastPeer(
+          id: "r$_recipientCounter",
+          name: name,
+          userId: userId,
+          publicKey: key,
+        ),
+      );
+      _recipientNameController.clear();
+      _recipientUserIdController.clear();
+      _recipientKeyController.clear();
+    });
+  }
+
+  void _removeRecipient(String id) {
+    setState(() {
+      _recipients.removeWhere((r) => r.id == id);
+    });
+  }
+
+  Future<void> _sendBroadcast() async {
+    final myUserId = _myUserIdController.text.trim();
+    final text = _messageController.text.trim();
+
+    if (!_connected || !_registered) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Connect relay first")),
+      );
+      return;
+    }
+
+    if (!_keysReady) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Keys not ready yet")),
+      );
+      return;
+    }
+
+    if (myUserId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Enter My User ID")),
+      );
+      return;
+    }
+
+    if (_recipients.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Add at least one recipient")),
+      );
+      return;
+    }
+
+    if (text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Type a message first")),
+      );
+      return;
+    }
+
+    _messageCounter++;
+    final baseId = "grp_$_messageCounter";
+    final expiresAtMs = DateTime.now()
+        .toUtc()
+        .add(Duration(seconds: _selectedTtl))
+        .millisecondsSinceEpoch;
+
+    final item = SentBroadcastItem(
+      baseMessageId: baseId,
+      text: text,
+      expiresAtMs: expiresAtMs,
+      recipients: _recipients
+          .map(
+            (r) => SentRecipientStatus(
+              userId: r.userId,
+              name: r.name,
+              state: "Sent",
+            ),
+          )
+          .toList(),
+    );
+
+    setState(() {
+      _sentBroadcasts.insert(0, item);
+      _messageController.clear();
+    });
+
+    for (final recipient in _recipients) {
+      await _crypto.setPeerPublicKeyBase64(recipient.publicKey);
+
+      final encrypted = await _crypto.encrypt(jsonEncode({
+        "text": text,
+        "expiresAtMs": expiresAtMs,
+      }));
+
+      final packetMessageId = "$baseId|${recipient.userId}";
+
+      _transport.sendRaw(jsonEncode({
+        "type": "group_msg",
+        "messageId": packetMessageId,
+        "from": myUserId,
+        "to": recipient.userId,
+        "senderPublicKey": _myPublicKey,
+        "payload": encrypted,
+      }));
+    }
+  }
+
+  Future<void> _copyText(String label, String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("$label copied")),
     );
   }
 
-  Widget _packetList() {
-    if (encryptedPackets.isEmpty) {
-      return const Text("No encrypted packets yet");
-    }
-
-    return Column(
-      children: List.generate(encryptedPackets.length, (index) {
-        final packet = encryptedPackets[index];
-        return Card(
-          child: Padding(
-            padding: const EdgeInsets.all(10),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  "Packet for Peer ${index + 1}",
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 8),
-                SelectableText(
-                  packet,
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-        );
-      }),
+  Widget _chip(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.white24),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(text),
     );
+  }
+
+  Widget _section(String title, List<Widget> children) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            ...children,
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _quickMessages() {
+    const items = [
+      "Hello team 👋",
+      "നമസ്കാരം ടീം",
+      "नमस्ते टीम",
+      "வணக்கம் குழு",
+      "ನಮಸ್ಕಾರ ತಂಡ",
+      "مرحبا بالفريق",
+    ];
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: items.map((m) {
+        return ActionChip(
+          label: Text(m),
+          onPressed: () {
+            _messageController.text = m;
+            setState(() {});
+          },
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _liveDemoStatusCard() {
+    final latestSent =
+        _sentBroadcasts.isNotEmpty ? _sentBroadcasts.first.text : null;
+    final latestReceived =
+        _receivedMessages.isNotEmpty ? _receivedMessages.first : null;
+
+    return _section("Live Demo Status", [
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          _chip("Recipients: ${_recipients.length}"),
+          _chip("Received: ${_receivedMessages.length}"),
+          _chip(_registered ? "Broadcast Active" : "Not Ready"),
+        ],
+      ),
+      const SizedBox(height: 12),
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white10,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Text(
+          latestSent == null
+              ? "No sent broadcast yet"
+              : "Latest Sent: $latestSent",
+        ),
+      ),
+      const SizedBox(height: 12),
+      Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white10,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: latestReceived == null
+            ? const Text("No received message yet")
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Latest Received: ${latestReceived.text}"),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _chip("From ${latestReceived.fromUserId}"),
+                      _chip(
+                        "TTL ${_remainingSeconds(latestReceived.expiresAtMs)}s",
+                      ),
+                      _chip("Decrypted"),
+                    ],
+                  ),
+                ],
+              ),
+      ),
+    ]);
   }
 
   @override
   void dispose() {
+    _ticker?.cancel();
+    _myUserIdController.dispose();
+    _relayIpController.dispose();
     _messageController.dispose();
-    _peerController.dispose();
+    _recipientNameController.dispose();
+    _recipientUserIdController.dispose();
+    _recipientKeyController.dispose();
+    _transport.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final body = _initError != null
-        ? Center(
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Text(
-                "Initialization failed:\n$_initError",
-                textAlign: TextAlign.center,
-              ),
-            ),
-          )
-        : SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  "Your Public Key",
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 10),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(10),
-                    child: _loadingKeys
-                        ? const Row(
-                            children: [
-                              SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              ),
-                              SizedBox(width: 12),
-                              Text("Generating key pair..."),
-                            ],
-                          )
-                        : SelectableText(
-                            _publicKeyText,
-                            style: const TextStyle(fontSize: 12),
-                          ),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                const Text(
-                  "Add Peer Public Key",
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _peerController,
-                        decoration: const InputDecoration(
-                          hintText: "Paste peer public key",
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      icon: const Icon(Icons.add),
-                      onPressed: addPeer,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 15),
-                _peerList(),
-                const SizedBox(height: 20),
-                const Text(
-                  "Message",
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _messageController,
-                  decoration: const InputDecoration(
-                    hintText: "Enter message",
-                    border: OutlineInputBorder(),
-                  ),
-                  minLines: 1,
-                  maxLines: 4,
-                ),
-                const SizedBox(height: 15),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _loadingKeys ? null : encryptForAll,
-                    child: const Text("Create Encrypted Packets For All"),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                const Text(
-                  "Encrypted Packets",
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 10),
-                _packetList(),
-              ],
-            ),
-          );
-
     return Scaffold(
       appBar: AppBar(
         title: const Text("One-to-Many Secure Chat"),
       ),
-      body: body,
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              _section("Connection", [
+                TextField(
+                  controller: _myUserIdController,
+                  decoration: const InputDecoration(
+                    labelText: "My User ID",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _relayIpController,
+                  decoration: const InputDecoration(
+                    labelText: "Relay IP",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _connectRelay,
+                    child: const Text("Connect Relay"),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _chip(_connected ? "Connected" : "Offline"),
+                    _chip(_registered ? "Registered" : "Not Registered"),
+                    _chip(_status),
+                  ],
+                ),
+              ]),
+              const SizedBox(height: 16),
+              _section("My Public Key", [
+                SelectableText(_myPublicKey),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: () => _copyText("Public key", _myPublicKey),
+                    icon: const Icon(Icons.copy),
+                    label: const Text("Copy"),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 16),
+              _section("Add Recipients", [
+                TextField(
+                  controller: _recipientNameController,
+                  decoration: const InputDecoration(
+                    labelText: "Recipient Name",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _recipientUserIdController,
+                  decoration: const InputDecoration(
+                    labelText: "Recipient User ID",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _recipientKeyController,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: "Recipient Public Key",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _addRecipient,
+                    child: const Text("Add Recipient"),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (_recipients.isEmpty)
+                  const Text("No recipients added")
+                else
+                  ..._recipients.map((r) {
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      child: ListTile(
+                        title: Text(r.name),
+                        subtitle: Text(r.userId),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          onPressed: () => _removeRecipient(r.id),
+                        ),
+                      ),
+                    );
+                  }),
+              ]),
+              const SizedBox(height: 16),
+              _section("Compose Broadcast", [
+                _quickMessages(),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _messageController,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    hintText: "Type one broadcast message...",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Text("TTL"),
+                    const SizedBox(width: 10),
+                    DropdownButton<int>(
+                      value: _selectedTtl,
+                      items: _ttlOptions
+                          .map(
+                            (s) => DropdownMenuItem(
+                              value: s,
+                              child: Text("${s}s"),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (v) {
+                        if (v == null) return;
+                        setState(() => _selectedTtl = v);
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: _sendBroadcast,
+                    icon: const Icon(Icons.send),
+                    label: const Text("Send Broadcast"),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 16),
+              _liveDemoStatusCard(),
+              const SizedBox(height: 16),
+              _section("Sent Broadcasts", [
+                if (_sentBroadcasts.isEmpty)
+                  const Text("No sent broadcasts yet")
+                else
+                  ..._sentBroadcasts.map((msg) {
+                    final ttl = _remainingSeconds(msg.expiresAtMs);
+
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              msg.text,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                _chip("${msg.recipients.length} recipients"),
+                                _chip(ttl > 0 ? "TTL ${ttl}s" : "Expired"),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            ...msg.recipients.map((r) {
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 6),
+                                child: Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  children: [
+                                    _chip(r.name),
+                                    _chip(r.userId),
+                                    _chip(r.state),
+                                  ],
+                                ),
+                              );
+                            }),
+                          ],
+                        ),
+                      ),
+                    );
+                  }),
+              ]),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

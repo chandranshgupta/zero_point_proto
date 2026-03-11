@@ -15,20 +15,18 @@ class ChatItem {
   final MsgDirection direction;
   final String encrypted;
   final String text;
-  int secondsLeft;
+  final int expiresAtMs;
   bool showEncrypted;
   MsgState state;
-  Timer? timer;
 
   ChatItem({
     required this.id,
     required this.direction,
     required this.encrypted,
     required this.text,
-    required this.secondsLeft,
+    required this.expiresAtMs,
     this.showEncrypted = false,
     this.state = MsgState.active,
-    this.timer,
   });
 }
 
@@ -62,6 +60,7 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
 
   int _identityRemaining = 0;
   Timer? _identityTick;
+  Timer? _uiTick;
 
   @override
   void initState() {
@@ -74,6 +73,7 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
     await _initKeys();
     _listenIncoming();
     _startIdentityCountdown();
+    _startUiTicker();
   }
 
   Future<void> _initKeys() async {
@@ -82,6 +82,38 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
     setState(() {
       _myPublicKeyBase64 = _e2ee.exportMyPublicKeyBase64();
     });
+  }
+
+  void _startUiTicker() {
+    _uiTick?.cancel();
+    _uiTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      _cleanupExpiredMessages();
+      setState(() {});
+    });
+  }
+
+  void _cleanupExpiredMessages() {
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+
+    for (final item in _items) {
+      if (item.state == MsgState.active && nowMs >= item.expiresAtMs) {
+        item.state = MsgState.deleted;
+      }
+    }
+
+    _items.removeWhere(
+      (item) =>
+          item.state == MsgState.deleted &&
+          nowMs >= item.expiresAtMs + 2000,
+    );
+  }
+
+  int _remainingSecondsFor(ChatItem item) {
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    final leftMs = item.expiresAtMs - nowMs;
+    if (leftMs <= 0) return 0;
+    return ((leftMs + 999) ~/ 1000);
   }
 
   void _listenIncoming() {
@@ -96,19 +128,15 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
         final parsed = E2EEPayload.fromJson(map);
 
         final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
-        final leftMs = parsed.expiresAtMs - nowMs;
-        final leftSeconds = (leftMs / 1000).ceil();
-        if (leftSeconds <= 0) return;
+        if (parsed.expiresAtMs <= nowMs) return;
 
         final item = ChatItem(
           id: parsed.id,
           direction: MsgDirection.received,
           encrypted: payloadEnc,
           text: parsed.text,
-          secondsLeft: leftSeconds,
+          expiresAtMs: parsed.expiresAtMs,
         );
-
-        _startTimer(item);
 
         if (!mounted) return;
         setState(() {
@@ -126,8 +154,8 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
 
     try {
       await _e2ee.setPeerPublicKeyBase64(peerKey);
-      if (!mounted) return;
 
+      if (!mounted) return;
       setState(() {
         _keysReady = _e2ee.isReady;
       });
@@ -147,6 +175,7 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
     final ok = await _transport.connectToServer(ip, port: 4040);
 
     if (!mounted) return;
+
     setState(() {
       _connected = ok;
       _netStatus = ok
@@ -159,39 +188,6 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
         content: Text(ok ? "Relay connected ✅" : "Relay connection failed ❌"),
       ),
     );
-  }
-
-  void _startTimer(ChatItem item) {
-    item.timer?.cancel();
-
-    item.timer = Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted) return;
-
-      if (item.state == MsgState.deleted) {
-        t.cancel();
-        return;
-      }
-
-      setState(() {
-        item.secondsLeft -= 1;
-      });
-
-      if (item.secondsLeft <= 0) {
-        t.cancel();
-
-        setState(() {
-          item.state = MsgState.deleted;
-          item.secondsLeft = 0;
-        });
-
-        Timer(const Duration(seconds: 2), () {
-          if (!mounted) return;
-          setState(() {
-            _items.removeWhere((m) => m.id == item.id);
-          });
-        });
-      }
-    });
   }
 
   void _startIdentityCountdown() {
@@ -218,10 +214,6 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
   }
 
   Future<void> _secureWipeAll({bool showToast = true}) async {
-    for (final m in _items) {
-      m.timer?.cancel();
-    }
-
     setState(() {
       _items.clear();
     });
@@ -263,10 +255,11 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
     }
 
     final nowUtc = DateTime.now().toUtc();
+
     final msgSeconds = (_identityRemaining > 0)
         ? (_selectedTimer < _identityRemaining
-        ? _selectedTimer
-        : _identityRemaining)
+            ? _selectedTimer
+            : _identityRemaining)
         : _selectedTimer;
 
     final expiresAtUtc = nowUtc.add(Duration(seconds: msgSeconds));
@@ -284,10 +277,8 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
       direction: MsgDirection.sent,
       encrypted: enc,
       text: payload.text,
-      secondsLeft: msgSeconds,
+      expiresAtMs: payload.expiresAtMs,
     );
-
-    _startTimer(item);
 
     setState(() {
       _items.insert(0, item);
@@ -318,7 +309,7 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
 
   Widget _messageBubble(ChatItem m) {
     final isSent = m.direction == MsgDirection.sent;
-    final align = isSent ? CrossAxisAlignment.end : CrossAxisAlignment.start;
+    final remaining = _remainingSecondsFor(m);
 
     final bubbleColor = m.state == MsgState.deleted
         ? Colors.white10
@@ -329,7 +320,8 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       child: Column(
-        crossAxisAlignment: align,
+        crossAxisAlignment:
+            isSent ? CrossAxisAlignment.end : CrossAxisAlignment.start,
         children: [
           Container(
             padding: const EdgeInsets.all(12),
@@ -345,8 +337,9 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
                   title,
                   style: TextStyle(
                     fontSize: 16,
-                    color:
-                    m.state == MsgState.deleted ? Colors.white54 : Colors.white,
+                    color: m.state == MsgState.deleted
+                        ? Colors.white54
+                        : Colors.white,
                     fontStyle: m.state == MsgState.deleted
                         ? FontStyle.italic
                         : FontStyle.normal,
@@ -362,7 +355,7 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
                     _chip(
                       m.state == MsgState.deleted
                           ? "Expired"
-                          : "Expires ${m.secondsLeft}s",
+                          : "Expires ${remaining}s",
                     ),
                   ],
                 ),
@@ -407,9 +400,35 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
     );
   }
 
+  Widget _languageQuickBar() {
+    final samples = <String>[
+      "Hello 👋",
+      "നമസ്കാരം",
+      "नमस्ते",
+      "வணக்கம்",
+      "ನಮಸ್ಕಾರ",
+      "Hola",
+      "مرحبا",
+    ];
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: samples.map((text) {
+        return ActionChip(
+          label: Text(text),
+          onPressed: () {
+            _messageController.text = text;
+            setState(() {});
+          },
+        );
+      }).toList(),
+    );
+  }
+
   Widget _buildTopSection() {
     final sessionText =
-    _identityRemaining > 0 ? _fmt(_identityRemaining) : "--:--:--";
+        _identityRemaining > 0 ? _fmt(_identityRemaining) : "--:--:--";
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -479,7 +498,7 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
               items: _timerOptions
                   .map(
                     (s) => DropdownMenuItem(value: s, child: Text("${s}s")),
-              )
+                  )
                   .toList(),
               onChanged: (v) {
                 if (v == null) return;
@@ -490,16 +509,21 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
             ),
           ],
         ),
+        const SizedBox(height: 12),
+        const Text(
+          "Quick multilingual messages:",
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        _languageQuickBar(),
       ],
     );
   }
 
   @override
   void dispose() {
-    for (final m in _items) {
-      m.timer?.cancel();
-    }
     _identityTick?.cancel();
+    _uiTick?.cancel();
     _messageController.dispose();
     _peerKeyController.dispose();
     _peerIpController.dispose();
@@ -543,18 +567,19 @@ class _E2EEChatScreenState extends State<E2EEChatScreen> {
             else
               ..._items.map(_messageBubble),
             const SizedBox(height: 12),
+            TextField(
+              controller: _messageController,
+              minLines: 1,
+              maxLines: 4,
+              decoration: const InputDecoration(
+                hintText: "Type message… (English / മലയാളം / हिंदी / தமிழ் / ಕನ್ನಡ / العربية)",
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
             Row(
               children: [
-                Expanded(
-                  child: TextField(
-                    controller: _messageController,
-                    decoration: const InputDecoration(
-                      hintText: "Type message…",
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
+                const Spacer(),
                 IconButton(
                   icon: const Icon(Icons.send),
                   onPressed: _sendMessage,

@@ -161,7 +161,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     'Test Real E2EE',
                     () => Navigator.push(
                       context,
-                      MaterialPageRoute(builder: (_) => const E2EETestScreen()),
+                      MaterialPageRoute(builder: (_) => E2EETestScreen()),
                     ),
                   ),
                   _actionButton(

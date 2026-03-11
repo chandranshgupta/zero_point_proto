@@ -11,39 +11,32 @@ class P2PWsTransport {
 
   Future<bool> connectToServer(String ip, {int port = 4040}) async {
     try {
-      final socket = await WebSocket.connect('ws://$ip:$port');
-      _socket = socket;
+      _socket = await WebSocket.connect('ws://$ip:$port');
 
-      socket.listen(
-            (data) {
-          _incomingController.add(data.toString());
-        },
+      _socket!.listen(
+        (data) => _incomingController.add(data.toString()),
         onDone: () {
           _socket = null;
-          print('WebSocket disconnected');
         },
-        onError: (e) {
+        onError: (_) {
           _socket = null;
-          print('WebSocket error: $e');
         },
         cancelOnError: true,
       );
 
-      print('WebSocket connected to ws://$ip:$port');
       return true;
-    } catch (e) {
+    } catch (_) {
       _socket = null;
-      print('Connect failed: $e');
       return false;
     }
   }
 
+  void sendRaw(String jsonString) {
+    _socket?.add(jsonString);
+  }
+
   void send(String message) {
-    if (_socket == null) {
-      print('Send failed: socket is null');
-      return;
-    }
-    _socket!.add(message);
+    _socket?.add(message);
   }
 
   String pack(String encryptedBase64) {
@@ -59,9 +52,7 @@ class P2PWsTransport {
       if (obj is Map<String, dynamic> && obj["type"] == "msg") {
         return obj["payload"] as String?;
       }
-    } catch (e) {
-      print("Unpack failed: $e");
-    }
+    } catch (_) {}
     return null;
   }
 
