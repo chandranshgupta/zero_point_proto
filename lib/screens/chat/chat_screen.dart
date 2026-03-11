@@ -1,18 +1,31 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
-import '../../services/encryption_service.dart';
+import '../../services/link_safety_service.dart';
 
-class EphemeralMessage {
+enum DemoBubbleType {
+  normal,
+  scanning,
+  safety,
+}
+
+class DemoChatItem {
   final String id;
-  final String encrypted;
-  int secondsLeft;
-  Timer? timer;
+  final String text;
+  final bool isMine;
+  final DemoBubbleType type;
+  final String? label;
+  final int? detected;
+  final int? total;
+  final String? url;
 
-  EphemeralMessage({
+  DemoChatItem({
     required this.id,
-    required this.encrypted,
-    required this.secondsLeft,
-    this.timer,
+    required this.text,
+    required this.isMine,
+    required this.type,
+    this.label,
+    this.detected,
+    this.total,
+    this.url,
   });
 }
 
@@ -24,107 +37,279 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final TextEditingController controller = TextEditingController();
-  final EncryptionService encryptionService = EncryptionService();
+  final _messageController = TextEditingController();
+  final List<DemoChatItem> _items = [];
+  int _counter = 0;
 
-  final List<EphemeralMessage> messages = [];
+  // Android emulator -> local backend on laptop
+  final _linkSafety = LinkSafetyService(
+    baseUrl: 'http://10.0.2.2:5050',
+  );
 
-  static int _idCounter = 0;
-  String _nextId() => (++_idCounter).toString();
+  String _nextId() => 'msg_${++_counter}';
 
-  void sendMessage() {
-    final text = controller.text.trim();
+  Future<void> _sendMessage() async {
+    final text = _messageController.text.trim();
     if (text.isEmpty) return;
 
-    final enc = encryptionService.encryptMessage(text);
-
-    final msg = EphemeralMessage(
+    final userMessage = DemoChatItem(
       id: _nextId(),
-      encrypted: enc,
-      secondsLeft: 30,
+      text: text,
+      isMine: true,
+      type: DemoBubbleType.normal,
     );
 
-    msg.timer = Timer.periodic(const Duration(seconds: 1), (t) {
-      if (!mounted) return;
-      setState(() {
-        msg.secondsLeft -= 1;
-      });
-
-      if (msg.secondsLeft <= 0) {
-        t.cancel();
-        if (!mounted) return;
-        setState(() {
-          messages.removeWhere((m) => m.id == msg.id);
-        });
-      }
+    setState(() {
+      _items.insert(0, userMessage);
+      _messageController.clear();
     });
+
+    final url = extractFirstUrl(text);
+    if (url == null) return;
+
+    final scanningId = _nextId();
 
     setState(() {
-      messages.insert(0, msg);
-      controller.clear();
+      _items.insert(
+        0,
+        DemoChatItem(
+          id: scanningId,
+          text: 'Scanning link...',
+          isMine: false,
+          type: DemoBubbleType.scanning,
+          url: url,
+        ),
+      );
     });
+
+    final result = await _linkSafety.scanUrl(url);
+
+    if (!mounted) return;
+
+    final index = _items.indexWhere((e) => e.id == scanningId);
+    if (index == -1) return;
+
+    if (result == null) {
+      setState(() {
+        _items[index] = DemoChatItem(
+          id: scanningId,
+          text: 'Link Safety\nScan failed',
+          isMine: false,
+          type: DemoBubbleType.safety,
+          label: 'unknown',
+          detected: 0,
+          total: 0,
+          url: url,
+        );
+      });
+      return;
+    }
+
+    setState(() {
+      _items[index] = DemoChatItem(
+        id: scanningId,
+        text: result.summary,
+        isMine: false,
+        type: DemoBubbleType.safety,
+        label: result.label,
+        detected: result.detected,
+        total: result.total,
+        url: result.url,
+      );
+    });
+  }
+
+  Color _bubbleColor(DemoChatItem item) {
+    if (item.type == DemoBubbleType.normal) {
+      return item.isMine ? Colors.blueGrey.shade700 : Colors.grey.shade800;
+    }
+
+    if (item.type == DemoBubbleType.scanning) {
+      return Colors.orange.shade700;
+    }
+
+    switch (item.label) {
+      case 'safe':
+        return Colors.green.shade700;
+      case 'risky_but_can_try':
+        return Colors.orange.shade700;
+      case 'risky':
+        return Colors.red.shade700;
+      default:
+        return Colors.grey.shade700;
+    }
+  }
+
+  String _labelText(String? label) {
+    switch (label) {
+      case 'safe':
+        return 'Safe';
+      case 'risky_but_can_try':
+        return 'Risky but can try';
+      case 'risky':
+        return 'Risky';
+      default:
+        return 'Unknown';
+    }
+  }
+
+  Widget _messageBubble(DemoChatItem item) {
+    final align =
+        item.isMine ? CrossAxisAlignment.end : CrossAxisAlignment.start;
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      child: Column(
+        crossAxisAlignment: align,
+        children: [
+          Container(
+            constraints: const BoxConstraints(maxWidth: 340),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: _bubbleColor(item),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: item.type == DemoBubbleType.safety
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Link Safety',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                      if ((item.url ?? '').isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          item.url!,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 8),
+                      Text(
+                        _labelText(item.label),
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        item.text,
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      if (item.total != null && item.total! > 0) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          '${item.detected}/${item.total} engines flagged it',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ],
+                  )
+                : Text(
+                    item.text,
+                    style: const TextStyle(color: Colors.white),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _quickSamples() {
+    const samples = [
+      'Check this https://example.com',
+      'Open this link https://google.com',
+      'Random message without link',
+    ];
+
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: samples.map((sample) {
+        return ActionChip(
+          label: Text(
+            sample.length > 24 ? '${sample.substring(0, 24)}...' : sample,
+          ),
+          onPressed: () {
+            _messageController.text = sample;
+            setState(() {});
+          },
+        );
+      }).toList(),
+    );
   }
 
   @override
   void dispose() {
-    for (final m in messages) {
-      m.timer?.cancel();
-    }
-    controller.dispose();
+    _messageController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text("Secure Chat (30s self-destruct)")),
-      body: Column(
-        children: [
-          Expanded(
-            child: messages.isEmpty
-                ? const Center(child: Text("No messages yet"))
-                : ListView.builder(
-                    reverse: true,
-                    itemCount: messages.length,
-                    itemBuilder: (context, index) {
-                      final m = messages[index];
-                      final dec = encryptionService.decryptMessage(m.encrypted);
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
 
-                      return ListTile(
-                        title: Text(dec),
-                        subtitle: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            SelectableText("Encrypted: ${m.encrypted}"),
-                            Text("Self-destruct in: ${m.secondsLeft}s"),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: controller,
-                    decoration: const InputDecoration(
-                      hintText: "Enter message",
-                      border: OutlineInputBorder(),
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('AES Demo Chat + Link Checker'),
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: _quickSamples(),
+              ),
+            ),
+            Expanded(
+              child: ListView.builder(
+                reverse: true,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                itemCount: _items.length,
+                itemBuilder: (context, index) {
+                  final item = _items[index];
+                  return _messageBubble(item);
+                },
+              ),
+            ),
+            Padding(
+              padding: EdgeInsets.fromLTRB(16, 8, 16, 12 + bottomInset),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        hintText: 'Type a message or paste a URL...',
+                        border: OutlineInputBorder(),
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  icon: const Icon(Icons.send),
-                  onPressed: sendMessage,
-                )
-              ],
+                  const SizedBox(width: 8),
+                  IconButton(
+                    onPressed: _sendMessage,
+                    icon: const Icon(Icons.send),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

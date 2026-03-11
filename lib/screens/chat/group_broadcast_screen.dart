@@ -3,9 +3,11 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import '../../services/e2ee_service.dart';
 import '../../services/p2p_ws_transport.dart';
+import 'qr_scanner_screen.dart';
 
 class BroadcastPeer {
   final String id;
@@ -72,6 +74,7 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
   final _myUserIdController = TextEditingController();
   final _relayIpController = TextEditingController(text: "10.0.2.2");
   final _messageController = TextEditingController();
+  final _inviteController = TextEditingController();
 
   final _recipientNameController = TextEditingController();
   final _recipientUserIdController = TextEditingController();
@@ -89,6 +92,7 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
 
   String _status = "Not connected";
   String _myPublicKey = "Generating...";
+  String _myInviteCode = "";
 
   bool _connected = false;
   bool _registered = false;
@@ -263,7 +267,71 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
     } catch (_) {}
   }
 
-  void _addRecipient() {
+  void _generateInvite() {
+    final userId = _myUserIdController.text.trim();
+
+    if (userId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Enter My User ID first")),
+      );
+      return;
+    }
+
+    final code = "$userId|$_myPublicKey";
+
+    setState(() {
+      _myInviteCode = code;
+    });
+  }
+
+  void _joinInviteCode(String invite) {
+    final code = invite.trim();
+
+    if (!code.contains("|")) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Invalid invite code")),
+      );
+      return;
+    }
+
+    final firstSep = code.indexOf("|");
+    final userId = code.substring(0, firstSep).trim();
+    final key = code.substring(firstSep + 1).trim();
+
+    if (userId.isEmpty || key.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Invalid invite format")),
+      );
+      return;
+    }
+
+    final alreadyExists = _recipients.any((r) => r.userId == userId);
+    if (alreadyExists) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("$userId already added")),
+      );
+      return;
+    }
+
+    setState(() {
+      _recipientCounter++;
+      _recipients.add(
+        BroadcastPeer(
+          id: "r$_recipientCounter",
+          name: userId,
+          userId: userId,
+          publicKey: key,
+        ),
+      );
+      _inviteController.clear();
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("Added recipient $userId")),
+    );
+  }
+
+  void _addRecipientManual() {
     final name = _recipientNameController.text.trim();
     final userId = _recipientUserIdController.text.trim();
     final key = _recipientKeyController.text.trim();
@@ -392,6 +460,57 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
     );
   }
 
+  Future<void> _showMyQrDialog() async {
+    if (_myInviteCode.isEmpty) {
+      _generateInvite();
+    }
+
+    if (_myInviteCode.isEmpty) return;
+
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("My Invite QR"),
+        content: SingleChildScrollView(
+          child: Column(
+            children: [
+              QrImageView(
+                data: _myInviteCode,
+                version: QrVersions.auto,
+                size: 220,
+              ),
+              const SizedBox(height: 16),
+              SelectableText(_myInviteCode),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => _copyText("Invite", _myInviteCode),
+            child: const Text("Copy Invite"),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("Close"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openScanner() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => QrScannerScreen(
+          onScanned: (code) {
+            _joinInviteCode(code);
+          },
+        ),
+      ),
+    );
+  }
+
   Widget _chip(String text) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -514,6 +633,7 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
     _myUserIdController.dispose();
     _relayIpController.dispose();
     _messageController.dispose();
+    _inviteController.dispose();
     _recipientNameController.dispose();
     _recipientUserIdController.dispose();
     _recipientKeyController.dispose();
@@ -581,7 +701,57 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
                 ),
               ]),
               const SizedBox(height: 16),
-              _section("Add Recipients", [
+              _section("Invite QR / Join Invite", [
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _generateInvite,
+                    child: const Text("Generate Invite"),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (_myInviteCode.isNotEmpty) SelectableText(_myInviteCode),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _myInviteCode.isEmpty ? null : _showMyQrDialog,
+                        icon: const Icon(Icons.qr_code),
+                        label: const Text("Show QR"),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _openScanner,
+                        icon: const Icon(Icons.qr_code_scanner),
+                        label: const Text("Scan QR"),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _inviteController,
+                  minLines: 2,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: "Paste Invite Code",
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () => _joinInviteCode(_inviteController.text),
+                    child: const Text("Join Invite"),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 16),
+              _section("Add Recipients (Manual Fallback)", [
                 TextField(
                   controller: _recipientNameController,
                   decoration: const InputDecoration(
@@ -611,7 +781,7 @@ class _GroupBroadcastScreenState extends State<GroupBroadcastScreen> {
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton(
-                    onPressed: _addRecipient,
+                    onPressed: _addRecipientManual,
                     child: const Text("Add Recipient"),
                   ),
                 ),

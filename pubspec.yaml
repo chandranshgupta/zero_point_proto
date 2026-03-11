@@ -8,6 +8,8 @@ environment:
   sdk: ">=3.3.0 <4.0.0"
 
 dependencies:
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.1.4
   flutter:
     sdk: flutter
 
@@ -22,6 +24,7 @@ dependencies:
 
   # Real E2EE (X25519 + AES-GCM)
   cryptography: ^2.5.0
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:
